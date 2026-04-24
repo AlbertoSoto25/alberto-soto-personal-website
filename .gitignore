@@ -1,0 +1,32 @@
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+CLAUDE.md
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.class
+.metals/
+.claude/
+.bloop/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Prompts
+src/main/resources/prompts/
+
+# Secrets
+.env
+*.pem
