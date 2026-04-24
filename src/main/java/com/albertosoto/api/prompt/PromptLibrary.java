@@ -14,8 +14,6 @@ public enum PromptLibrary {
   DEFAULT("default", null),
   ALBERTO_ASSISTANT("alberto_assistant", "prompts/alberto_assistant.json");
 
-  private static final ObjectMapper MAPPER = new ObjectMapper();
-
   private final String key;
   private final String systemPrompt;
   private final List<SeedTurn> seedTurns;
@@ -37,7 +35,7 @@ public enum PromptLibrary {
       if (is == null) {
         throw new IllegalStateException("Prompt file not found on classpath: " + path);
       }
-      return MAPPER.readValue(is, PromptFile.class);
+      return new ObjectMapper().readValue(is, PromptFile.class);
     } catch (IOException e) {
       throw new IllegalStateException("Failed to load prompt file: " + path, e);
     }
