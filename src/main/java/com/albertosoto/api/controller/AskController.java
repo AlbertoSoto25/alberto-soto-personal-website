@@ -57,17 +57,16 @@ public class AskController implements Controller {
 
     private String extractIp(APIGatewayProxyRequestEvent request) {
         Map<String, String> headers = request.getHeaders();
+        logger.info("ASK headers={}", headers);
         if (headers != null) {
-            String xff = headers.get("x-forwarded-for");
+            String xff = headers.get("X-Forwarded-For");
             if (xff != null && !xff.isBlank()) {
                 String ip = xff.split(",")[0].trim();
-                logger.info("ASK ip_source=x-forwarded-for raw=\"{}\" resolved={}", xff, ip);
+                logger.info("ASK ip_source=X-Forwarded-For raw=\"{}\" resolved={}", xff, ip);
                 return ip;
             }
         }
-        String ip = request.getRequestContext().getIdentity().getSourceIp();
-        logger.info("ASK ip_source=request_context resolved={}", ip);
-        return ip;
+        throw new ApiException(400, "X-Forwarded-For header is required");
     }
 
     private AskRequest parseRequest(String body) {
