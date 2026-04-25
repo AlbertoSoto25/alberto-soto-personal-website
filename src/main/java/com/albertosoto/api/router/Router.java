@@ -1,6 +1,7 @@
 package com.albertosoto.api.router;
 
 import com.albertosoto.api.config.BedrockClientConfig;
+import com.albertosoto.api.config.CorsConfig;
 import com.albertosoto.api.config.DynamoDbClientConfig;
 import com.albertosoto.api.controller.AskController;
 import com.albertosoto.api.controller.Controller;
@@ -9,8 +10,8 @@ import com.albertosoto.api.exception.ApiException;
 import com.albertosoto.api.service.AskService;
 import com.albertosoto.api.service.RateLimiter;
 import com.amazonaws.services.lambda.runtime.Context;
-import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;
-import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;
+import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;
+import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -29,12 +30,6 @@ public class Router {
     private static final int HTTP_NOT_FOUND = 404;
     private static final int HTTP_METHOD_NOT_ALLOWED = 405;
 
-    private static final Map<String, String> CORS_HEADERS = Map.of(
-            "Access-Control-Allow-Origin",  "*",
-            "Access-Control-Allow-Methods", "POST,OPTIONS",
-            "Access-Control-Allow-Headers", "Content-Type,Authorization"
-    );
-
     /** Key format: "METHOD /path" */
     private final Map<String, Controller> routes = new HashMap<>();
 
@@ -52,20 +47,30 @@ public class Router {
      *
      * @throws ApiException if no route matches (404) or method is not allowed (405).
      */
-    public APIGatewayV2HTTPResponse route(
-            final APIGatewayV2HTTPEvent request,
+    public APIGatewayProxyResponseEvent route(
+            final APIGatewayProxyRequestEvent request,
             final Context context) {
 
-        final String path   = normalizePath(request.getRawPath());
-        final String method = request.getRequestContext().getHttp().getMethod().toUpperCase();
+        final String path   = normalizePath(request.getPath());
+        final String method = request.getHttpMethod().toUpperCase();
 
         if ("OPTIONS".equals(method)) {
             logger.info("PREFLIGHT OPTIONS {}", path);
-            return APIGatewayV2HTTPResponse.builder()
+            final String requestOrigin = request.getHeaders() != null
+                    ? request.getHeaders().get("origin")
+                    : null;
+            final String allowedOrigin = CorsConfig.resolveOrigin(requestOrigin);
+            final Map<String, String> preflightHeaders = new HashMap<>();
+            if (allowedOrigin != null) {
+                preflightHeaders.put("Access-Control-Allow-Origin",  allowedOrigin);
+                preflightHeaders.put("Access-Control-Allow-Methods", "POST,OPTIONS");
+                preflightHeaders.put("Access-Control-Allow-Headers", "Content-Type,Authorization");
+                preflightHeaders.put("Vary",                         "Origin");
+            }
+            return new APIGatewayProxyResponseEvent()
                     .withStatusCode(HTTP_OK)
-                    .withHeaders(CORS_HEADERS)
-                    .withBody("")
-                    .build();
+                    .withHeaders(preflightHeaders)
+                    .withBody("");
         }
 
         final String key = method + " " + path;

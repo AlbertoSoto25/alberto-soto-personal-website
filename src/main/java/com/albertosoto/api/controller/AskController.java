@@ -6,8 +6,8 @@ import com.albertosoto.api.model.response.AskResponse;
 import com.albertosoto.api.service.AskService;
 import com.albertosoto.api.service.RateLimiter;
 import com.amazonaws.services.lambda.runtime.Context;
-import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;
-import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;
+import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;
+import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.apache.logging.log4j.LogManager;
@@ -33,7 +33,7 @@ public class AskController implements Controller {
     private final RateLimiter rateLimiter;
 
     @Override
-    public APIGatewayV2HTTPResponse handle(APIGatewayV2HTTPEvent request, Context context) {
+    public APIGatewayProxyResponseEvent handle(APIGatewayProxyRequestEvent request, Context context) {
         AskRequest askRequest = parseRequest(request.getBody());
         logger.info("ASK question_b64={}", askRequest.getQuestion());
         askRequest.setQuestion(decodeQuestion(askRequest.getQuestion()));
@@ -55,7 +55,7 @@ public class AskController implements Controller {
         return buildResponse(askResponse);
     }
 
-    private String extractIp(APIGatewayV2HTTPEvent request) {
+    private String extractIp(APIGatewayProxyRequestEvent request) {
         Map<String, String> headers = request.getHeaders();
         if (headers != null) {
             String xff = headers.get("x-forwarded-for");
@@ -65,7 +65,7 @@ public class AskController implements Controller {
                 return ip;
             }
         }
-        String ip = request.getRequestContext().getHttp().getSourceIp();
+        String ip = request.getRequestContext().getIdentity().getSourceIp();
         logger.info("ASK ip_source=request_context resolved={}", ip);
         return ip;
     }
@@ -89,25 +89,23 @@ public class AskController implements Controller {
         }
     }
 
-    private APIGatewayV2HTTPResponse buildResponse(AskResponse askResponse) {
+    private APIGatewayProxyResponseEvent buildResponse(AskResponse askResponse) {
         try {
-            return APIGatewayV2HTTPResponse.builder()
+            return new APIGatewayProxyResponseEvent()
                     .withStatusCode(HTTP_OK)
                     .withHeaders(JSON_HEADER)
-                    .withBody(objectMapper.writeValueAsString(askResponse))
-                    .build();
+                    .withBody(objectMapper.writeValueAsString(askResponse));
         } catch (Exception e) {
             throw new ApiException(500, "Failed to serialise response", e);
         }
     }
 
-    private APIGatewayV2HTTPResponse buildErrorResponse(int statusCode, String message) {
+    private APIGatewayProxyResponseEvent buildErrorResponse(int statusCode, String message) {
         try {
-            return APIGatewayV2HTTPResponse.builder()
+            return new APIGatewayProxyResponseEvent()
                     .withStatusCode(statusCode)
                     .withHeaders(JSON_HEADER)
-                    .withBody(objectMapper.writeValueAsString(Map.of("error", message)))
-                    .build();
+                    .withBody(objectMapper.writeValueAsString(Map.of("error", message)));
         } catch (Exception e) {
             throw new ApiException(500, "Failed to serialise error response", e);
         }
