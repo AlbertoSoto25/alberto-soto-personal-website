@@ -5,33 +5,35 @@ import com.albertosoto.api.exception.ApiException;
 import com.albertosoto.api.model.request.AskRequest;
 import com.albertosoto.api.model.response.AskResponse;
 import com.albertosoto.api.prompt.PromptLibrary;
+import lombok.RequiredArgsConstructor;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import software.amazon.awssdk.core.async.SdkPublisher;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.services.bedrockruntime.model.ContentBlock;
 import software.amazon.awssdk.services.bedrockruntime.model.ConversationRole;
 import software.amazon.awssdk.services.bedrockruntime.model.ConverseRequest;
 import software.amazon.awssdk.services.bedrockruntime.model.ConverseResponse;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseStreamOutput;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseStreamRequest;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseStreamResponse;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseStreamResponseHandler;
 import software.amazon.awssdk.services.bedrockruntime.model.GuardrailConfiguration;
+import software.amazon.awssdk.services.bedrockruntime.model.GuardrailStreamConfiguration;
 import software.amazon.awssdk.services.bedrockruntime.model.InferenceConfiguration;
 import software.amazon.awssdk.services.bedrockruntime.model.Message;
 import software.amazon.awssdk.services.bedrockruntime.model.SystemContentBlock;
 
-import lombok.RequiredArgsConstructor;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
-/**
- * Orchestrates a single-turn conversation with AWS Bedrock via the Converse API.
- *
- * <p>Conversation structure (in order):
- * <ol>
- *   <li>System prompt — resolved from {@link PromptLibrary} by {@code BEDROCK_SYSTEM_PROMPT_KEY}</li>
- *   <li>Seed turns (optional) — USER/ASSISTANT pairs from {@link PromptLibrary} that prime the model</li>
- *   <li>User message — the question from the incoming {@link AskRequest}</li>
- * </ol>
- */
 @RequiredArgsConstructor
 public class AskService {
 
@@ -39,14 +41,6 @@ public class AskService {
 
   private final BedrockClientConfig config;
 
-
-  /**
-   * Sends the question to Bedrock and returns the model's answer.
-   *
-   * @param request incoming request containing the user's question
-   * @return response DTO with the model's reply
-   * @throws ApiException on validation failures or Bedrock errors
-   */
   public AskResponse ask(AskRequest request) {
     PromptLibrary prompts = resolvePrompts(config.getSystemPromptKey());
     logger.info("BEDROCK prompt_key={} model={} max_tokens={}", config.getSystemPromptKey(), config.getModelId(), config.getMaxTokens());
@@ -67,6 +61,87 @@ public class AskService {
     ConverseResponse converseResponse = invoke(converseRequest);
     logger.info("BEDROCK responded stop_reason={}", converseResponse.stopReasonAsString());
     return mapResponse(converseResponse);
+  }
+
+  public void askStream(AskRequest request, OutputStream out) {
+    PromptLibrary prompts = resolvePrompts(config.getSystemPromptKey());
+    logger.info("BEDROCK_STREAM model={} max_tokens={}", config.getModelId(), config.getMaxTokens());
+
+    ConverseStreamRequest converseRequest = ConverseStreamRequest.builder()
+        .modelId(config.getModelId())
+        .system(buildSystemBlocks(prompts))
+        .messages(buildMessages(prompts, request))
+        .inferenceConfig(buildInferenceConfig())
+        .guardrailConfig(GuardrailStreamConfiguration.builder()
+            .guardrailIdentifier(config.getGuardrailId())
+            .guardrailVersion(config.getGuardrailVersion())
+            .build())
+        .build();
+
+    LinkedBlockingQueue<Optional<String>> queue = new LinkedBlockingQueue<>();
+    AtomicReference<Throwable> streamError = new AtomicReference<>();
+
+    ConverseStreamResponseHandler responseHandler = new ConverseStreamResponseHandler() {
+      @Override
+      public void responseReceived(ConverseStreamResponse response) {}
+
+      @Override
+      public void onEventStream(SdkPublisher<ConverseStreamOutput> publisher) {
+        publisher.subscribe(event -> event.accept(
+            ConverseStreamResponseHandler.Visitor.builder()
+                .onContentBlockDelta(e -> {
+                  String text = e.delta().text();
+                  if (text != null) {
+                    logger.info("BEDROCK_STREAM chunk length={} content=\"{}\"", text.length(), text);
+                    queue.offer(Optional.of(text));
+                  }
+                })
+                .build()
+        ));
+      }
+
+      @Override
+      public void exceptionOccurred(Throwable throwable) {
+        streamError.compareAndSet(null, throwable);
+        queue.offer(Optional.empty());
+      }
+
+      @Override
+      public void complete() {
+        queue.offer(Optional.empty());
+      }
+    };
+
+    config.getAsyncClient().converseStream(converseRequest, responseHandler);
+
+    // Main thread drains the queue and writes to the OutputStream,
+    // so each chunk is flushed to the network from the handler thread.
+    try {
+      while (true) {
+        Optional<String> item = queue.poll(60, TimeUnit.SECONDS);
+        if (item == null) {
+          throw new ApiException(502, "Bedrock stream timed out");
+        }
+        if (item.isEmpty()) break;
+        try {
+          out.write(item.get().getBytes(StandardCharsets.UTF_8));
+          out.flush();
+        } catch (IOException ioEx) {
+          logger.error("BEDROCK_STREAM write_error: {}", ioEx.getMessage());
+          break;
+        }
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new ApiException(500, "Bedrock streaming interrupted");
+    }
+
+    Throwable t = streamError.get();
+    if (t != null) {
+      throw new ApiException(502, "Bedrock streaming failed: " + t.getMessage());
+    }
+
+    logger.info("BEDROCK_STREAM complete");
   }
 
   private PromptLibrary resolvePrompts(String key) {
@@ -105,9 +180,7 @@ public class AskService {
   private InferenceConfiguration buildInferenceConfig() {
     InferenceConfiguration.Builder builder = InferenceConfiguration.builder()
         .maxTokens(config.getMaxTokens());
-
     config.getTemperature().ifPresent(builder::temperature);
-
     return builder.build();
   }
 

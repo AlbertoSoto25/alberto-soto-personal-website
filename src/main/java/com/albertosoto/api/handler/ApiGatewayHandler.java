@@ -1,85 +1,106 @@
 package com.albertosoto.api.handler;
 
 import com.albertosoto.api.config.CorsConfig;
+import com.albertosoto.api.controller.AskController;
 import com.albertosoto.api.exception.ApiException;
 import com.albertosoto.api.router.Router;
 import com.amazonaws.services.lambda.runtime.Context;
-import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.RequestStreamHandler;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Lambda entry point. Receives all API Gateway REST proxy events and delegates
- * routing to {@link Router}.
+ * Lambda entry point. POST /ask is served with response streaming; all other
+ * routes are buffered but still written in the streaming-format envelope
+ * required by API Gateway when the integration uses InvokeWithResponseStream.
  */
-public class ApiGatewayHandler
-        implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
+public class ApiGatewayHandler implements RequestStreamHandler {
 
     private static final Logger logger = LogManager.getLogger(ApiGatewayHandler.class);
-    private static final int HTTP_INTERNAL_ERROR = 500;
+    private static final byte[] STREAM_DELIMITER = new byte[8];
 
     private final Router router;
+    private final AskController askController;
     private final ObjectMapper objectMapper;
 
     public ApiGatewayHandler() {
-        this.objectMapper = new ObjectMapper();
+        this.objectMapper = new ObjectMapper()
+                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
         this.router = new Router(objectMapper);
+        this.askController = router.getAskController();
     }
 
     @Override
-    public APIGatewayProxyResponseEvent handleRequest(
-            final APIGatewayProxyRequestEvent request,
-            final Context context) {
+    public void handleRequest(InputStream input, OutputStream output, Context context) throws IOException {
+        APIGatewayProxyRequestEvent request = objectMapper.readValue(input, APIGatewayProxyRequestEvent.class);
 
-        final String method = request.getHttpMethod();
-        final String path   = request.getPath();
-        logger.info("REQUEST  {} {}", method, path);
+        String method = request.getHttpMethod() != null ? request.getHttpMethod().toUpperCase() : "";
+        String path   = normalizePath(request.getPath());
+        logger.info("REQUEST {} {}", method, path);
 
+        String origin        = request.getHeaders() != null ? request.getHeaders().get("origin") : null;
+        String allowedOrigin = CorsConfig.resolveOrigin(origin);
+
+        if ("POST".equals(method) && "/ask".equals(path)) {
+            askController.handleStreaming(request, output, allowedOrigin);
+        } else {
+            handleBuffered(request, output, context, allowedOrigin);
+        }
+    }
+
+    private void handleBuffered(
+            APIGatewayProxyRequestEvent request,
+            OutputStream output,
+            Context context,
+            String allowedOrigin) throws IOException {
+
+        APIGatewayProxyResponseEvent response;
         try {
-            final APIGatewayProxyResponseEvent response = withCors(request, router.route(request, context));
-            logResponse(method, path, response);
-            return response;
+            response = router.route(request, context);
         } catch (ApiException e) {
             logger.warn("API_ERROR {} {}", e.getStatusCode(), e.getMessage());
-            final APIGatewayProxyResponseEvent errorResponse = withCors(request, buildErrorResponse(e.getStatusCode(), e.getMessage()));
-            logResponse(method, path, errorResponse);
-            return errorResponse;
+            response = buildErrorResponse(e.getStatusCode(), e.getMessage());
         } catch (Exception e) {
             logger.error("UNHANDLED_ERROR {}: {}", e.getClass().getSimpleName(), e.getMessage(), e);
-            final APIGatewayProxyResponseEvent errorResponse = withCors(request, buildErrorResponse(HTTP_INTERNAL_ERROR, "Internal server error"));
-            logResponse(method, path, errorResponse);
-            return errorResponse;
+            response = buildErrorResponse(500, "Internal server error");
         }
+
+        response = withCors(response, allowedOrigin);
+        logger.info("RESPONSE {} {} status={}", request.getHttpMethod(), request.getPath(), response.getStatusCode());
+        writeBufferedResponse(output, response);
     }
 
-    private void logResponse(final String method, final String path, final APIGatewayProxyResponseEvent response) {
-        try {
-            logger.info("LAMBDA_RESPONSE {} {} - statusCode={} headers={} body={}",
-                    method, path,
-                    response.getStatusCode(),
-                    objectMapper.writeValueAsString(response.getHeaders()),
-                    response.getBody());
-        } catch (Exception e) {
-            logger.warn("LAMBDA_RESPONSE_LOG_FAILED {}", e.getMessage());
+    private void writeBufferedResponse(OutputStream output, APIGatewayProxyResponseEvent response) throws IOException {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("statusCode", response.getStatusCode());
+        if (response.getHeaders() != null && !response.getHeaders().isEmpty()) {
+            metadata.put("headers", response.getHeaders());
         }
+        output.write(objectMapper.writeValueAsBytes(metadata));
+        output.write(STREAM_DELIMITER);
+        if (response.getBody() != null) {
+            output.write(response.getBody().getBytes(StandardCharsets.UTF_8));
+        }
+        output.flush();
     }
 
-    private APIGatewayProxyResponseEvent withCors(
-            final APIGatewayProxyRequestEvent request,
-            final APIGatewayProxyResponseEvent response) {
-
-        final String requestOrigin = request.getHeaders() != null
-                ? request.getHeaders().get("origin")
-                : null;
-        final String allowedOrigin = CorsConfig.resolveOrigin(requestOrigin);
-
-        final Map<String, String> headers = new java.util.HashMap<>();
-        if (response.getHeaders() != null) headers.putAll(response.getHeaders());
+    private APIGatewayProxyResponseEvent withCors(APIGatewayProxyResponseEvent response, String allowedOrigin) {
+        Map<String, String> headers = new HashMap<>();
+        if (response.getHeaders() != null) {
+            headers.putAll(response.getHeaders());
+        }
         if (allowedOrigin != null) {
             headers.put("Access-Control-Allow-Origin", allowedOrigin);
             headers.put("Vary", "Origin");
@@ -89,16 +110,22 @@ public class ApiGatewayHandler
         return response;
     }
 
-    private APIGatewayProxyResponseEvent buildErrorResponse(final int statusCode, final String message) {
+    private String normalizePath(String rawPath) {
+        if (rawPath == null || rawPath.isBlank()) return "/";
+        return rawPath.endsWith("/") && rawPath.length() > 1
+                ? rawPath.substring(0, rawPath.length() - 1)
+                : rawPath;
+    }
+
+    private APIGatewayProxyResponseEvent buildErrorResponse(int statusCode, String message) {
         try {
-            final String body = objectMapper.writeValueAsString(Map.of("error", message));
             return new APIGatewayProxyResponseEvent()
                     .withStatusCode(statusCode)
                     .withHeaders(Map.of("Content-Type", "application/json"))
-                    .withBody(body);
+                    .withBody(objectMapper.writeValueAsString(Map.of("error", message)));
         } catch (Exception e) {
             return new APIGatewayProxyResponseEvent()
-                    .withStatusCode(HTTP_INTERNAL_ERROR)
+                    .withStatusCode(500)
                     .withBody("{\"error\":\"Internal server error\"}");
         }
     }

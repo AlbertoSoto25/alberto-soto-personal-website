@@ -32,14 +32,20 @@ public class Router {
 
     /** Key format: "METHOD /path" */
     private final Map<String, Controller> routes = new HashMap<>();
+    private final AskController askController;
 
     public Router(final ObjectMapper objectMapper) {
         BedrockClientConfig bedrockConfig = new BedrockClientConfig();
         AskService askService = new AskService(bedrockConfig);
         DynamoDbClientConfig dynamoDbConfig = new DynamoDbClientConfig();
         RateLimiter rateLimiter = new RateLimiter(dynamoDbConfig.getClient(), dynamoDbConfig.getDailyLimit());
-        routes.put("POST /ask",     new AskController(objectMapper, askService, rateLimiter));
+        this.askController = new AskController(objectMapper, askService, rateLimiter);
+        routes.put("POST /ask",     this.askController);
         routes.put("POST /session", new SessionController(objectMapper));
+    }
+
+    public AskController getAskController() {
+        return askController;
     }
 
     /**

@@ -2,6 +2,7 @@ package com.albertosoto.api.config;
 
 import com.albertosoto.api.exception.ApiException;
 import lombok.Getter;
+import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeAsyncClient;
 import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
 
 import java.util.Optional;
@@ -40,6 +41,7 @@ public final class BedrockClientConfig {
   private final String guardrailId;
   private final String guardrailVersion;
   private final BedrockRuntimeClient client;
+  private final BedrockRuntimeAsyncClient asyncClient;
 
 
   public BedrockClientConfig() {
@@ -50,12 +52,16 @@ public final class BedrockClientConfig {
     this.guardrailId = requireEnv(ENV_GUARDRAIL_ID);
     this.guardrailVersion = parseGuardrailVersion(System.getenv(ENV_GUARDRAIL_VERSION));
     this.client = buildClient();
+    this.asyncClient = buildAsyncClient();
   }
 
 
   private static BedrockRuntimeClient buildClient() {
-    return BedrockRuntimeClient.builder()
-        .build();
+    return BedrockRuntimeClient.builder().build();
+  }
+
+  private static BedrockRuntimeAsyncClient buildAsyncClient() {
+    return BedrockRuntimeAsyncClient.builder().build();
   }
 
   private static String requireEnv(String name) {
